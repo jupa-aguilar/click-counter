@@ -1,5 +1,6 @@
 import './style.css'
 import { load, save, uid, normalize } from './store.js'
+import * as sync from './sync.js'
 import {
   INTERVALS, MAX_BOX, today, addDays, daysBetween, nextBox, schedule,
   isDue, isMastered, streak, inDaysLabel, agoLabel,
@@ -16,6 +17,8 @@ let route = { view: 'topics' }
 let session = null // sesión de estudio en curso
 let review = null // repaso de tarjetas en curso
 let ticker = null
+let syncStatus = 'local' // local | connecting | synced | error
+let localDirty = false // hubo cambios antes de conectar con la cuenta
 
 // ---------- utilidades ----------
 
@@ -32,6 +35,51 @@ const lastSession = topicId =>
 
 function persist() {
   storageOk = save(state)
+  localDirty = true
+  sync.push(state)
+}
+
+// Diálogo propio: el visor de claude.ai no muestra confirm() ni alert().
+function ask({ title, message = '', confirmLabel = 'Aceptar', cancelLabel = 'Cancelar', danger = false }) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div')
+    overlay.className = 'modal-backdrop'
+    overlay.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <h2 id="modal-title">${esc(title)}</h2>
+        ${message ? `<p>${esc(message)}</p>` : ''}
+        <div class="row end">
+          ${cancelLabel ? `<button class="btn ghost" data-answer="no">${esc(cancelLabel)}</button>` : ''}
+          <button class="btn ${danger ? 'danger-solid' : 'primary'}" data-answer="yes">${esc(confirmLabel)}</button>
+        </div>
+      </div>`
+    const close = answer => {
+      overlay.remove()
+      document.removeEventListener('keydown', onKey, true)
+      resolve(answer)
+    }
+    const onKey = event => {
+      if (event.key === 'Escape') close(false)
+      event.stopPropagation()
+    }
+    overlay.addEventListener('click', event => {
+      if (event.target === overlay) return close(false)
+      const button = event.target.closest('[data-answer]')
+      if (button) close(button.dataset.answer === 'yes')
+    })
+    document.addEventListener('keydown', onKey, true)
+    document.body.append(overlay)
+    overlay.querySelector('[data-answer="yes"]').focus()
+  })
+}
+
+function notify(message) {
+  const toast = document.createElement('div')
+  toast.className = 'toast'
+  toast.setAttribute('role', 'status')
+  toast.textContent = message
+  document.body.append(toast)
+  setTimeout(() => toast.remove(), 6000)
 }
 
 function markActive() {
@@ -39,10 +87,19 @@ function markActive() {
   if (!state.activeDays.includes(day)) state.activeDays.push(day)
 }
 
-function leaveSessionOk() {
+async function leaveSessionOk() {
   if (!session) return true
   const inProgress = !['goal', 'done'].includes(session.step)
-  if (inProgress && !confirm('Tienes una sesión en curso. ¿Abandonarla? Se perderá lo que escribiste.')) return false
+  if (inProgress) {
+    const leave = await ask({
+      title: '¿Abandonar la sesión?',
+      message: 'Se perderá lo que escribiste en esta sesión.',
+      confirmLabel: 'Abandonar',
+      cancelLabel: 'Seguir estudiando',
+      danger: true,
+    })
+    if (!leave) return false
+  }
   endSession()
   return true
 }
@@ -54,8 +111,8 @@ function endSession() {
   document.title = APP_TITLE
 }
 
-function go(view, params = {}) {
-  if (!leaveSessionOk()) return
+async function go(view, params = {}) {
+  if (!(await leaveSessionOk())) return
   route = { view, ...params }
   render()
   scrollTo(0, 0)
@@ -65,7 +122,7 @@ function go(view, params = {}) {
 
 function render() {
   const views = { topics: viewTopics, topic: viewTopic, session: viewSession, review: viewReview, progress: viewProgress }
-  const warning = storageOk
+  const warning = storageOk || syncStatus === 'synced'
     ? ''
     : '<p class="banner">⚠️ No se pudo guardar en este navegador (¿modo privado?). Exporta tus datos desde Progreso para no perderlos.</p>'
   app.innerHTML = `${header()}<main class="main">${warning}${views[route.view]()}</main>`
@@ -353,8 +410,8 @@ function viewSession() {
   return ''
 }
 
-function startSession(topicId) {
-  if (!leaveSessionOk()) return
+async function startSession(topicId) {
+  if (!(await leaveSessionOk())) return
   session = { topicId, step: 'goal' }
   route = { view: 'session' }
   render()
@@ -446,8 +503,8 @@ function addDraft() {
 
 // ---------- repaso ----------
 
-function startReview(topicId) {
-  if (!leaveSessionOk()) return
+async function startReview(topicId) {
+  if (!(await leaveSessionOk())) return
   const t = today()
   const queue = state.cards
     .filter(c => isDue(c, t) && (!topicId || c.topicId === topicId))
@@ -603,8 +660,9 @@ function viewProgress() {
     </section>
 
     <section class="card stack">
-      <h2>Copia de seguridad</h2>
-      <p class="hint">Tus datos viven solo en este navegador. Exporta un archivo para no perderlos o pasarlos a otro dispositivo.</p>
+      <h2>Tus datos</h2>
+      ${syncMessage()}
+      <p class="hint">También puedes exportar un archivo como copia de seguridad.</p>
       <div class="row">
         <button class="btn" data-action="export">Exportar</button>
         <button class="btn ghost" data-action="import">Importar</button>
@@ -613,11 +671,33 @@ function viewProgress() {
     </section>`
 }
 
-function exportData() {
-  const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' })
+function syncMessage() {
+  const messages = {
+    synced: ['ok', 'Se guardan en tu cuenta de Claude: los ves igual en el celular y en la computadora.'],
+    connecting: ['', 'Conectando con tu cuenta…'],
+    error: ['warn', 'No se pudieron guardar los últimos cambios en tu cuenta. Se reintentará con el próximo cambio.'],
+    local: ['', 'Se guardan solo en este navegador.'],
+  }
+  const [tone, text] = messages[syncStatus]
+  return `<p class="sync ${tone}">${esc(text)}</p>`
+}
+
+async function exportData() {
+  const filename = `explicamelo-${today()}.json`
+  const json = JSON.stringify(state, null, 2)
+  const downloads = await sync.capability('downloads')
+  if (downloads) {
+    try {
+      await downloads.save({ filename, data: json })
+    } catch (error) {
+      if (error?.code !== 'declined') notify('No se pudo exportar el archivo en este dispositivo.')
+    }
+    return
+  }
+  const blob = new Blob([json], { type: 'application/json' })
   const link = Object.assign(document.createElement('a'), {
     href: URL.createObjectURL(blob),
-    download: `explicamelo-${today()}.json`,
+    download: filename,
   })
   link.click()
   setTimeout(() => URL.revokeObjectURL(link.href), 1000)
@@ -625,16 +705,24 @@ function exportData() {
 
 async function importData(file) {
   if (!file) return
+  let data
   try {
-    const data = normalize(JSON.parse(await file.text()))
-    const summary = `${plural(data.topics.length, 'tema', 'temas')} y ${plural(data.cards.length, 'tarjeta', 'tarjetas')}`
-    if (!confirm(`El archivo tiene ${summary}. Esto reemplazará tus datos actuales. ¿Continuar?`)) return
-    state = data
-    persist()
-    render()
+    data = normalize(JSON.parse(await file.text()))
   } catch {
-    alert('No se pudo leer el archivo. ¿Es una exportación de Explícamelo?')
+    notify('No se pudo leer el archivo. Elige un .json exportado desde Explícamelo.')
+    return
   }
+  const summary = `${plural(data.topics.length, 'tema', 'temas')} y ${plural(data.cards.length, 'tarjeta', 'tarjetas')}`
+  const replace = await ask({
+    title: '¿Reemplazar tus datos?',
+    message: `El archivo tiene ${summary}. Reemplazará todo lo que tienes ahora.`,
+    confirmLabel: 'Reemplazar',
+    danger: true,
+  })
+  if (!replace) return
+  state = data
+  persist()
+  render()
 }
 
 // ---------- eventos ----------
@@ -644,17 +732,23 @@ const actions = {
   'open-topic': el => go('topic', { id: el.dataset.id }),
   'start-session': el => startSession(el.dataset.id),
   'review-topic': el => startReview(el.dataset.id),
-  'delete-topic': el => {
+  'delete-topic': async el => {
     const topic = topicById(el.dataset.id)
-    if (!confirm(`¿Eliminar “${topic.title}” con todas sus tarjetas y sesiones? No se puede deshacer.`)) return
+    const remove = await ask({
+      title: `¿Eliminar “${topic.title}”?`,
+      message: 'Se borrarán también sus tarjetas y sesiones. No se puede deshacer.',
+      confirmLabel: 'Eliminar tema',
+      danger: true,
+    })
+    if (!remove) return
     state.topics = state.topics.filter(t => t.id !== topic.id)
     state.cards = state.cards.filter(c => c.topicId !== topic.id)
     state.sessions = state.sessions.filter(s => s.topicId !== topic.id)
     persist()
     go('topics')
   },
-  'delete-card': el => {
-    if (!confirm('¿Eliminar esta tarjeta?')) return
+  'delete-card': async el => {
+    if (!(await ask({ title: '¿Eliminar esta tarjeta?', confirmLabel: 'Eliminar', danger: true }))) return
     state.cards = state.cards.filter(c => c.id !== el.dataset.id)
     persist()
     render()
@@ -735,15 +829,24 @@ const forms = {
     render()
     scrollTo(0, 0)
   },
-  'session-cards': (_, form) => {
+  'session-cards': async (_, form) => {
     const drafts = readDrafts(form)
     const chosen = drafts.filter(d => d.use && (d.q || d.a))
     const complete = chosen.filter(d => d.q && d.a)
     const incomplete = chosen.length - complete.length
-    if (incomplete && !confirm(`${plural(incomplete, 'tarjeta está incompleta', 'tarjetas están incompletas')} (falta pregunta o respuesta) y no se ${incomplete === 1 ? 'guardará' : 'guardarán'}. ¿Continuar?`)) {
-      session.drafts = drafts
-      return
+    if (incomplete) {
+      const proceed = await ask({
+        title: `${plural(incomplete, 'tarjeta incompleta', 'tarjetas incompletas')}`,
+        message: `Les falta la pregunta o la respuesta y no se ${incomplete === 1 ? 'guardará' : 'guardarán'}.`,
+        confirmLabel: 'Terminar igual',
+        cancelLabel: 'Completarlas',
+      })
+      if (!proceed) {
+        session.drafts = drafts
+        return
+      }
     }
+    if (session?.step !== 'cards') return
     const t = today()
     const topic = topicById(session.topicId)
     for (const d of complete) {
@@ -809,4 +912,69 @@ addEventListener('beforeunload', event => {
   if (session && !['goal', 'done'].includes(session.step)) event.preventDefault()
 })
 
+// ---------- sincronización con la cuenta ----------
+
+const busy = () =>
+  session || (route.view === 'review' && review?.queue.length) || document.querySelector('.modal-backdrop') ||
+  document.activeElement?.matches('input, textarea')
+
+function mergeStates(remote, local) {
+  const byId = (a, b) => [...new Map([...a, ...b].map(x => [x.id, x])).values()]
+  return {
+    topics: byId(remote.topics, local.topics),
+    cards: byId(remote.cards, local.cards),
+    sessions: byId(remote.sessions, local.sessions),
+    activeDays: [...new Set([...remote.activeDays, ...local.activeDays])].sort(),
+  }
+}
+
+function adopt(remote) {
+  state = remote
+  storageOk = save(state)
+  if (!busy()) render()
+}
+
+async function startSync() {
+  if (!globalThis.claude?.use) return
+  syncStatus = 'connecting'
+  const ok = await sync.connect(() => {
+    syncStatus = 'error'
+    notify('No se pudieron guardar los cambios en tu cuenta. Revisa tu conexión.')
+  })
+  if (!ok) {
+    syncStatus = 'local'
+    return
+  }
+  try {
+    const remote = await sync.pull()
+    syncStatus = 'synced'
+    if (!remote) {
+      sync.push(state) // primera vez: sube lo que hubiera en este navegador
+    } else if (localDirty) {
+      adopt(mergeStates(remote, state)) // cambios hechos mientras conectaba
+      sync.push(state)
+    } else {
+      adopt(remote)
+    }
+  } catch {
+    syncStatus = 'error'
+  }
+  if (route.view === 'progress' && !busy()) render()
+}
+
+// Al volver a la app (por ejemplo, después de usarla en el celular), trae
+// lo último guardado en la cuenta.
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState !== 'visible' || !sync.connected() || !sync.idle() || busy()) return
+  try {
+    const remote = await sync.pull()
+    if (remote && JSON.stringify(remote) !== JSON.stringify(normalize(state)) && sync.idle() && !busy()) {
+      adopt(remote)
+    }
+  } catch {
+    // Sin conexión: se sigue con lo que hay en pantalla.
+  }
+})
+
 render()
+startSync()

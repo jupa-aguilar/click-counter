@@ -27,7 +27,10 @@ En **Progreso** ves tu racha de días, los minutos de foco, las tarjetas dominad
 
 ## Tus datos
 
-Todo se guarda en tu navegador (`localStorage`); no hay servidor ni cuenta. Desde **Progreso → Copia de seguridad** puedes exportar un archivo JSON para respaldarlos o pasarlos a otro dispositivo.
+- **Publicada en claude.ai** (como Artifact): los datos se guardan en tu cuenta de Claude, así que ves lo mismo en el celular y en la computadora.
+- **En local** (`npm run dev`): se guardan solo en ese navegador (`localStorage`).
+
+En ambos casos, desde **Progreso → Tus datos** puedes exportar un archivo JSON como copia de seguridad, o importarlo.
 
 ## Desarrollo
 
@@ -35,12 +38,14 @@ Todo se guarda en tu navegador (`localStorage`); no hay servidor ni cuenta. Desd
 npm install
 npm run dev     # servidor de desarrollo
 npm test        # pruebas de la lógica de repetición espaciada
-npm run build   # versión para publicar, en dist/
+npm run build   # versión web normal, en dist/
+npm run build:artifact  # un solo archivo, dist/explicamelo.html, para publicar en claude.ai
 ```
 
 Código en `src/`:
 
 - `main.js`: interfaz y flujo de la sesión, el repaso y el progreso
 - `srs.js`: repetición espaciada (sistema Leitner) y fechas
-- `store.js`: guardado e importación de datos
+- `store.js`: guardado local e importación de datos
+- `sync.js`: sincronización con la cuenta de Claude cuando corre como Artifact
 - `style.css`: estilos, con modo claro y oscuro
